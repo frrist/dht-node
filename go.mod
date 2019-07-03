@@ -1,7 +1,9 @@
 module github.com/ipfs/dht-node
 
 require (
+	contrib.go.opencensus.io/exporter/jaeger v0.1.0
 	contrib.go.opencensus.io/exporter/prometheus v0.1.0
+	github.com/Kubuxu/go-more-timers v0.0.2 // indirect
 	github.com/axiomhq/hyperloglog v0.0.0-20190607114936-323ed515b11c
 	github.com/dustin/go-humanize v1.0.0
 	github.com/golang/snappy v0.0.1 // indirect
@@ -14,7 +16,7 @@ require (
 	github.com/libp2p/go-libp2p-connmgr v0.1.0
 	github.com/libp2p/go-libp2p-core v0.0.7-0.20190628102912-99d0f11616da
 	github.com/libp2p/go-libp2p-host v0.1.0
-	github.com/libp2p/go-libp2p-kad-dht v0.1.2-0.20190629173555-5ff18aae16c9
+	github.com/libp2p/go-libp2p-kad-dht v0.1.2-0.20190627125715-43e0b625f3c5
 	github.com/libp2p/go-libp2p-net v0.1.0
 	github.com/libp2p/go-libp2p-peer v0.2.0
 	github.com/libp2p/go-libp2p-peerstore v0.1.2-0.20190621130618-cfa9bb890c1a

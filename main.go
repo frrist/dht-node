@@ -8,16 +8,16 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"contrib.go.opencensus.io/exporter/jaeger"
 	"contrib.go.opencensus.io/exporter/prometheus"
-	"github.com/axiomhq/hyperloglog"
 	human "github.com/dustin/go-humanize"
 	ds "github.com/ipfs/go-datastore"
 	levelds "github.com/ipfs/go-ds-leveldb"
@@ -27,25 +27,22 @@ import (
 	libp2p "github.com/libp2p/go-libp2p"
 	circuit "github.com/libp2p/go-libp2p-circuit"
 	connmgr "github.com/libp2p/go-libp2p-connmgr"
-	crypto "github.com/libp2p/go-libp2p-core/crypto"
-	network "github.com/libp2p/go-libp2p-core/network"
-	peer "github.com/libp2p/go-libp2p-core/peer"
 	host "github.com/libp2p/go-libp2p-host"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	dhtmetrics "github.com/libp2p/go-libp2p-kad-dht/metrics"
 	dhtopts "github.com/libp2p/go-libp2p-kad-dht/opts"
+	peer "github.com/libp2p/go-libp2p-peer"
 	pstore "github.com/libp2p/go-libp2p-peerstore"
 	record "github.com/libp2p/go-libp2p-record"
 	id "github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	ma "github.com/multiformats/go-multiaddr"
 	prom "github.com/prometheus/client_golang/prometheus"
 	"go.opencensus.io/stats/view"
+	"go.opencensus.io/trace"
 	"go.opencensus.io/zpages"
 )
 
-var _ = dhtmetrics.DefaultViews
 var _ = circuit.P_CIRCUIT
-var _ = logwriter.WriterGroup
 
 var (
 	log           = logging.Logger("dhtbooster")
@@ -112,11 +109,9 @@ func bootstrapper() pstore.PeerInfo {
 var bootstrapDone int64
 
 func makeAndStartNode(ds ds.Batching, addr string, relay bool, bucketSize int, limiter chan struct{}) (host.Host, *dht.IpfsDHT, error) {
-	cmgr := connmgr.NewConnManager(1500, 2000, time.Minute)
+	cmgr := connmgr.NewConnManager(3000, 4000, time.Minute)
 
-	priv, _, _ := crypto.GenerateKeyPair(crypto.Ed25519, 0)
-
-	opts := []libp2p.Option{libp2p.ListenAddrStrings(addr), libp2p.ConnectionManager(cmgr), libp2p.Identity(priv)}
+	opts := []libp2p.Option{libp2p.ListenAddrStrings(addr), libp2p.ConnectionManager(cmgr)}
 	if relay {
 		opts = append(opts, libp2p.EnableRelay(circuit.OptHop))
 	}
@@ -185,8 +180,10 @@ func main() {
 	relay := flag.Bool("relay", false, "Enable libp2p circuit relaying for this node")
 	portBegin := flag.Int("portBegin", 0, "If set, begin port allocation here")
 	bucketSize := flag.Int("bucketSize", defaultKValue, "Specify the bucket size")
-	bootstrapConcurency := flag.Int("bootstrapConc", 32, "How many concurrent bootstraps to run")
-	stagger := flag.Duration("stagger", 0*time.Second, "Duration to stagger nodes starts by")
+	bootstrapConcurency := flag.Int("bootstrapConc", 128, "How many concurrent bootstraps to run")
+	sampling := flag.Float64("sampling", -1, "Enable tracing with the provided sampling value")
+	port := flag.Int("port", 3001, "Output traces as json on the provided port")
+	jaeger := flag.Bool("jaeger", false, "Enable Jaeger Exporter")
 	flag.Parse()
 	id.ClientVersion = "dhtbooster/2"
 
@@ -195,8 +192,21 @@ func main() {
 	}
 
 	if *pprofport > 0 {
-		fmt.Printf("Running metrics server on port: %d\n", *pprofport)
+		fmt.Println("Running metrics server on port: %d", *pprofport)
 		go setupMetrics(*pprofport)
+	}
+
+	if *sampling != -1 {
+		fmt.Printf("Tracing has been enabled, sampling: %f\n", *sampling)
+		if *jaeger {
+			je, err := setupJaegerTracing(*sampling)
+			if err != nil {
+				panic(err)
+			}
+			defer je.Flush()
+		} else {
+			setupTracing(*sampling, *port)
+		}
 	}
 
 	getPort := portSelector(*portBegin)
@@ -209,10 +219,10 @@ func main() {
 		return
 	}
 
-	runMany(*dbpath, getPort, *many, *bucketSize, *bootstrapConcurency, *relay, *stagger)
+	runMany(*dbpath, getPort, *many, *bucketSize, *bootstrapConcurency, *relay)
 }
 
-func runMany(dbpath string, getPort func() int, many, bucketSize, bsCon int, relay bool, stagger time.Duration) {
+func runMany(dbpath string, getPort func() int, many, bucketSize, bsCon int, relay bool) {
 	ds, err := levelds.NewDatastore(dbpath, nil)
 	if err != nil {
 		panic(err)
@@ -221,62 +231,24 @@ func runMany(dbpath string, getPort func() int, many, bucketSize, bsCon int, rel
 	start := time.Now()
 	var hosts []host.Host
 	var dhts []*dht.IpfsDHT
-
-	var hyperLock sync.Mutex
-	hyperlog := hyperloglog.New()
-	var peersConnected int64
-
-	notifiee := &network.NotifyBundle{
-		ConnectedF: func(_ network.Network, v network.Conn) {
-			hyperLock.Lock()
-			hyperlog.Insert([]byte(v.RemotePeer()))
-			hyperLock.Unlock()
-
-			atomic.AddInt64(&peersConnected, 1)
-		},
-		DisconnectedF: func(_ network.Network, v network.Conn) {
-			atomic.AddInt64(&peersConnected, -1)
-		},
-	}
-
-	fmt.Fprintf(os.Stderr, "Running %d DHT Instances:\n", many)
+	uniqpeers := make(map[peer.ID]struct{})
+	fmt.Fprintf(os.Stderr, "Running %d DHT Instances...\n", many)
 
 	limiter := make(chan struct{}, bsCon)
 	for i := 0; i < many; i++ {
-		time.Sleep(stagger)
-		fmt.Fprintf(os.Stderr, ".")
-
 		laddr := fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", getPort())
 		h, d, err := makeAndStartNode(ds, laddr, relay, bucketSize, limiter)
 		if err != nil {
 			panic(err)
 		}
-		h.Network().Notify(notifiee)
 		hosts = append(hosts, h)
 		dhts = append(dhts, d)
 	}
-	fmt.Fprintf(os.Stderr, "\n")
 
 	provs := make(chan *provInfo, 16)
-	//r, w := io.Pipe()
-	//logwriter.WriterGroup.AddWriter(w)
-	//go waitForNotifications(r, provs, nil)
-
-	go func() {
-		http.HandleFunc("/peers", func(w http.ResponseWriter, r *http.Request) {
-			var out []peer.AddrInfo
-			for _, h := range hosts {
-				out = append(out, peer.AddrInfo{
-					ID:    h.ID(),
-					Addrs: h.Addrs(),
-				})
-			}
-
-			json.NewEncoder(w).Encode(out)
-		})
-
-		http.ListenAndServe("127.0.0.1:7779", nil)
-	}()
+	r, w := io.Pipe()
+	logwriter.WriterGroup.AddWriter(w)
+	go waitForNotifications(r, provs, nil)
 
 	totalprovs := 0
 	reportInterval := time.NewTicker(time.Second * 5)
@@ -285,25 +257,29 @@ func runMany(dbpath string, getPort func() int, many, bucketSize, bsCon int, rel
 		case _, ok := <-provs:
 			if !ok {
 				totalprovs = -1
-				provs = nil
 			} else {
 				totalprovs++
 			}
 		case <-reportInterval.C:
-			hyperLock.Lock()
-			uniqpeers := hyperlog.Estimate()
-			hyperLock.Unlock()
-			printStatusLine(many, start, atomic.LoadInt64(&peersConnected), uniqpeers, totalprovs)
+			printStatusLine(many, start, hosts, dhts, uniqpeers, totalprovs)
 		}
 	}
 }
 
-func printStatusLine(ndht int, start time.Time, totalpeers int64, uniqpeers uint64, totalprovs int) {
+func printStatusLine(ndht int, start time.Time, hosts []host.Host, dhts []*dht.IpfsDHT, uniqprs map[peer.ID]struct{}, totalprovs int) {
 	uptime := time.Second * time.Duration(int(time.Since(start).Seconds()))
 	var mstat runtime.MemStats
 	runtime.ReadMemStats(&mstat)
+	var totalpeers int
+	for _, h := range hosts {
+		peers := h.Network().Peers()
+		totalpeers += len(peers)
+		for _, p := range peers {
+			uniqprs[p] = struct{}{}
+		}
+	}
 
-	fmt.Fprintf(os.Stderr, "[NumDhts: %d, Uptime: %s, Memory Usage: %s, TotalPeers: %d/%d, Total Provs: %d, BootstrapsDone: %d]\n", ndht, uptime, human.Bytes(mstat.Alloc), totalpeers, uniqpeers, totalprovs, atomic.LoadInt64(&bootstrapDone))
+	fmt.Fprintf(os.Stderr, "[NumDhts: %d, Uptime: %s, Memory Usage: %s, TotalPeers: %d/%d, Total Provs: %d, BootstrapsDone: %d]\n", ndht, uptime, human.Bytes(mstat.Alloc), totalpeers, len(uniqprs), totalprovs, atomic.LoadInt64(&bootstrapDone))
 }
 
 func runSingleDHTWithUI(path string, relay bool, bucketSize int) {
@@ -319,9 +295,9 @@ func runSingleDHTWithUI(path string, relay bool, bucketSize int) {
 	uniqpeers := make(map[peer.ID]struct{})
 	messages := make(chan string, 16)
 	provs := make(chan *provInfo, 16)
-	//r, w := io.Pipe()
-	//logwriter.WriterGroup.AddWriter(w)
-	//go waitForNotifications(r, provs, messages)
+	r, w := io.Pipe()
+	logwriter.WriterGroup.AddWriter(w)
+	go waitForNotifications(r, provs, messages)
 
 	ga := &GooeyApp{Title: "Libp2p DHT Node", Log: NewLog(15, 15)}
 	ga.NewDataLine(3, "Peer ID", h.ID().Pretty())
@@ -382,8 +358,6 @@ func setupMetrics(port int) error {
 		return err
 	}
 
-	_ = view.RegisterExporter
-	/* Disabling opencensus for now, it allocates too much
 	// register prometheus with opencensus
 	view.RegisterExporter(pe)
 	view.SetReportingPeriod(2)
@@ -392,7 +366,6 @@ func setupMetrics(port int) error {
 	if err := view.Register(dhtmetrics.DefaultViews...); err != nil {
 		return err
 	}
-	*/
 
 	go func() {
 		mux := http.NewServeMux()
@@ -411,4 +384,56 @@ func setupMetrics(port int) error {
 		}
 	}()
 	return nil
+}
+
+func newJsonTraceExporter(port int) *jsonTraceExporter {
+	con, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
+	if err != nil {
+		log.Fatalf("jsonTraceExporter Failed to dial: %v", err)
+	}
+	encoder := json.NewEncoder(con)
+	return &jsonTraceExporter{
+		enc: encoder,
+	}
+}
+
+// hacked this in to get traces with netcat
+type jsonTraceExporter struct {
+	enc *json.Encoder
+}
+
+func (ce *jsonTraceExporter) ExportSpan(sd *trace.SpanData) {
+	if err := ce.enc.Encode(sd); err != nil {
+		log.Fatalf("failed to encode span, connection is probably closed: %v", err)
+	}
+}
+
+func setupTracing(sampling float64, port int) {
+	trace.RegisterExporter(newJsonTraceExporter(port))
+	trace.ApplyConfig(trace.Config{DefaultSampler: trace.ProbabilitySampler(sampling)})
+}
+
+func setupJaegerTracing(sampling float64) (*jaeger.Exporter, error) {
+	collectorEndpointURI := "http://localhost:14268/api/traces"
+	// setup Jaeger
+	je, err := jaeger.NewExporter(jaeger.Options{
+		OnError:           func(err error) { log.Errorf("jaeger: %v", err) },
+		CollectorEndpoint: collectorEndpointURI,
+		Process: jaeger.Process{
+			ServiceName: "dht_node",
+			Tags:        []jaeger.Tag{
+				// example of how to add global tags
+				// jaeger.StringTag("cluster_id", cfg.ClusterID),
+			},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// register jaeger with opencensus
+	trace.RegisterExporter(je)
+	// configure tracing
+	trace.ApplyConfig(trace.Config{DefaultSampler: trace.ProbabilitySampler(sampling)})
+	return je, nil
 }
